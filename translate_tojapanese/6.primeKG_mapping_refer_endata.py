@@ -3,7 +3,7 @@ from collections import deque
 import pandas as pd
 
 
-def add_japanese_with_icd_cui_and_en(
+def add_japanese_with_icd_cui_and_en_v2(
     primekg_path,
     icd_master_path,
     cui_master_path,
@@ -68,16 +68,21 @@ def add_japanese_with_icd_cui_and_en(
                 en_to_ja_map[norm_en].update(ja_names)
 
     # --------------------------------------------------
-    # ★追加: 4. mondo.obo から親概念(is_a)の関係性を構築
+    # 4. mondo.obo から 親概念(is_a) および 廃止転送マップ(replaced_by / consider) を構築
     # --------------------------------------------------
-    print("mondo.obo から親概念(is_a)のツリー構造を解析しています...")
-    parent_map = {}  # 子MONDO_ID (7桁数値文字列) -> [親MONDO_IDのリスト]
+    print("mondo.obo を解析中 (親概念構造 & 廃止ノード転送マップ)...")
+    parent_map = {}  # 子MONDO_ID -> [親MONDO_IDのリスト]
+    replaced_by_map = {}  # 廃止MONDO_ID -> 現行MONDO_ID
+
     is_a_pattern = re.compile(r"^\s*is_a:\s*(MONDO:\d+)", re.IGNORECASE)
+    replaced_pattern = re.compile(
+        r"^\s*replaced_by:\s*(MONDO:\d+)", re.IGNORECASE
+    )
+    consider_pattern = re.compile(r"^\s*consider:\s*(MONDO:\d+)", re.IGNORECASE)
 
     def extract_mondo_num(mondo_str):
         if pd.isna(mondo_str) or not str(mondo_str).strip():
             return ""
-        # MONDO:0011160 -> 0011160 / 11160 -> 0011160
         clean_str = (
             str(mondo_str)
             .upper()
@@ -117,7 +122,27 @@ def add_japanese_with_icd_cui_and_en(
                     if parent_id:
                         parent_map[current_id].append(parent_id)
 
-    # 検索高速化用: MONDO ID -> 行データの逆引き辞書 (親ノード検索用)
+            elif line.startswith("replaced_by:"):
+                match = replaced_pattern.match(line)
+                if match and current_id:
+                    rep_id = extract_mondo_num(match.group(1))
+                    if rep_id:
+                        replaced_by_map[current_id] = rep_id
+
+            elif line.startswith("consider:"):
+                # replaced_by が定義されていない場合の代替候補として登録
+                if current_id and current_id not in replaced_by_map:
+                    match = consider_pattern.match(line)
+                    if match:
+                        cons_id = extract_mondo_num(match.group(1))
+                        if cons_id:
+                            replaced_by_map[current_id] = cons_id
+
+    print(
+        f"  └ obo解析完了: ノード数={len(parent_map)}, 廃止ノード転送ルール数={len(replaced_by_map)}"
+    )
+
+    # 検索高速化用: MONDO ID -> 行データの逆引き辞書
     mondo_to_row_map = {}
     for _, row in df_primekg.iterrows():
         m_id = extract_mondo_num(row.get("disease_id"))
@@ -125,8 +150,25 @@ def add_japanese_with_icd_cui_and_en(
             mondo_to_row_map[m_id] = row
 
     # --------------------------------------------------
-    # 検索関数群
+    # ヘルパー関数群
     # --------------------------------------------------
+    def get_active_mondo_id(mondo_id_str):
+        """廃止ノードID（obsolete）を現行のMONDO IDに自動変換する（多重置換対応）"""
+        m_id = extract_mondo_num(mondo_id_str)
+        if not m_id:
+            return ""
+
+        visited_ids = set()
+        curr = m_id
+        # ループ（多重リダイレクト）防止のため最大10回まで追跡
+        for _ in range(10):
+            if curr in replaced_by_map and curr not in visited_ids:
+                visited_ids.add(curr)
+                curr = replaced_by_map[curr]
+            else:
+                break
+        return curr
+
     def search_icd10(icd_str):
         if pd.isna(icd_str) or not str(icd_str).strip():
             return set()
@@ -169,14 +211,14 @@ def add_japanese_with_icd_cui_and_en(
             return en_to_ja_map[norm_en]
         return set()
 
-    # ★追加: 親概念(is_a)を幅優先探索(BFS)で遡って日本語名を検索
     def search_parent_ontology(mondo_id_str):
-        m_id = extract_mondo_num(mondo_id_str)
-        if not m_id or m_id not in parent_map:
+        """現行ノード（または廃止転送後のノード）から親概念(is_a)を幅優先探索(BFS)で遡って検索"""
+        active_id = get_active_mondo_id(mondo_id_str)
+        if not active_id or active_id not in parent_map:
             return set()
 
-        queue = deque(parent_map[m_id])
-        visited = {m_id}
+        queue = deque(parent_map[active_id])
+        visited = {active_id}
 
         while queue:
             curr_parent_id = queue.popleft()
@@ -184,26 +226,21 @@ def add_japanese_with_icd_cui_and_en(
                 continue
             visited.add(curr_parent_id)
 
-            # 親ノードのコード情報が存在すれば Step A〜C を試す
             if curr_parent_id in mondo_to_row_map:
                 parent_row = mondo_to_row_map[curr_parent_id]
 
-                # 親の ICD10 検索
                 p_icd = search_icd10(parent_row.get("ICD10_code"))
                 if p_icd:
                     return p_icd
 
-                # 親の CUI 検索
                 p_cui = search_cui(parent_row.get("CUI_code"))
                 if p_cui:
                     return p_cui
 
-                # 親の 英語名 検索
                 p_en = search_english(parent_row.get("disease_name_en"))
                 if p_en:
                     return p_en
 
-            # さらに上の親ノードへ拡張
             if curr_parent_id in parent_map:
                 for p_p in parent_map[curr_parent_id]:
                     if p_p not in visited:
@@ -212,17 +249,16 @@ def add_japanese_with_icd_cui_and_en(
         return set()
 
     # --------------------------------------------------
-    # 紐付け処理
+    # 紐付け処理（メイン）
     # --------------------------------------------------
-    print(
-        "日本語病名の紐付けを行っています (ICD-10 -> CUI -> 英語名 -> 親概念 の順で検索)..."
-    )
+    print("日本語病名の紐付けを行っています...")
     ja_names_result = []
 
     icd_hit_count = 0
     cui_hit_count = 0
     en_hit_count = 0
-    parent_hit_count = 0  # ★追加
+    obsolete_hit_count = 0  # 廃止ノード転送による直接ヒット数
+    parent_hit_count = 0  # 親概念検索によるヒット数
 
     for _, row in df_primekg.iterrows():
         matched_names = set()
@@ -245,13 +281,37 @@ def add_japanese_with_icd_cui_and_en(
                     matched_names.update(en_matches)
                     en_hit_count += 1
                 else:
-                    # ★ Step D: mondo.obo の親概念(is_a)を遡って検索
-                    parent_matches = search_parent_ontology(
-                        row.get("disease_id")
-                    )
-                    if parent_matches:
-                        matched_names.update(parent_matches)
-                        parent_hit_count += 1
+                    # ★ Step D-1: 廃止ノード（obsolete）転送先の現行ノード情報で再照合
+                    orig_mondo = row.get("disease_id")
+                    active_mondo = get_active_mondo_id(orig_mondo)
+
+                    if active_mondo and active_mondo != extract_mondo_num(
+                        orig_mondo
+                    ):
+                        if active_mondo in mondo_to_row_map:
+                            active_row = mondo_to_row_map[active_mondo]
+                            act_icd = search_icd10(active_row.get("ICD10_code"))
+                            act_cui = search_cui(active_row.get("CUI_code"))
+                            act_en = search_english(
+                                active_row.get("disease_name_en")
+                            )
+
+                            if act_icd:
+                                matched_names.update(act_icd)
+                            elif act_cui:
+                                matched_names.update(act_cui)
+                            elif act_en:
+                                matched_names.update(act_en)
+
+                            if matched_names:
+                                obsolete_hit_count += 1
+
+                    # ★ Step D-2: それでもヒットしない場合、親概念(is_a)を遡って検索
+                    if not matched_names:
+                        parent_matches = search_parent_ontology(orig_mondo)
+                        if parent_matches:
+                            matched_names.update(parent_matches)
+                            parent_hit_count += 1
 
         # 結果の整形
         if matched_names:
@@ -290,6 +350,9 @@ def add_japanese_with_icd_cui_and_en(
     print(f" ├ ICD-10 経由でマッチ: {icd_hit_count} 件")
     print(f" ├ CUI 経由で追加マッチ: {cui_hit_count} 件")
     print(f" ├ 英語名 経由で追加マッチ: {en_hit_count} 件")
+    print(
+        f" ├ 廃止ノード(obsolete)転送経由で追加マッチ: {obsolete_hit_count} 件"
+    )
     print(f" ├ 親概念(is_a) 経由で追加マッチ: {parent_hit_count} 件")
     print(
         f" └ 合計日本語化完了: {total_hits} 件 (カバー率: {total_hits/total_diseases*100:.1f}%)"
@@ -302,12 +365,12 @@ if __name__ == "__main__":
     icd_master_path = "/app/my_research_new/data/japanese_mapping/japanese_mapping_master/icd_master_utf8.csv"
     cui_master_path = "app/my_research_new/data/japanese_mapping/japanese_mapping_master/cui_master.csv"
     cui_en_master_path = "app/my_research_new/data/japanese_mapping/japanese_mapping_master/cui_master_inc_en.csv"
-    mondo_obo_path = "app/my_research_new/synEHR/data/mondo/mondo.obo"  # お持ちの mondo.obo のパスに指定してください
+    mondo_obo_path = "app/my_research_new/synEHR/data/mondo/mondo.obo"
     output_path = (
-        "app/my_research_new/data/japanese_mapping/primekg_disease_with_japanese_new.csv"
+        "app/my_research_new/data/japanese_mapping/primekg_disease_with_japanese.csv"
     )
 
-    add_japanese_with_icd_cui_and_en(
+    add_japanese_with_icd_cui_and_en_v2(
         primekg_path,
         icd_master_path,
         cui_master_path,
